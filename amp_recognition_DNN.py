@@ -600,6 +600,227 @@ def evaluate_model(model: keras.Model, X_test_seq: np.ndarray, X_test_feat: np.n
     return metrics
 
 
+def get_feature_names() -> List[str]:
+    """
+    Get list of feature names in the same order as extract_all_features.
+    
+    Returns:
+        List of feature names
+    """
+    # Create a dummy sequence to get feature names
+    dummy_seq = "ACDEFGHIKLMNPQRSTVWY"
+    
+    # Get feature names from a single sequence extraction
+    physico = extract_physicochemical_features(dummy_seq)
+    comp = extract_composition_features(dummy_seq)
+    seq_feat = extract_sequence_features(dummy_seq)
+    
+    # Combine and sort to match extract_all_features order
+    all_feat_dict = {**physico, **comp, **seq_feat}
+    return sorted(all_feat_dict.keys())
+
+
+def compute_feature_importance(model: keras.Model, X_test_seq: np.ndarray, 
+                               X_test_feat: np.ndarray, y_test: np.ndarray,
+                               feature_names: List[str], n_iterations: int = 5) -> Dict[str, float]:
+    """
+    Compute permutation importance for engineered features.
+    
+    Args:
+        model: Trained Keras model
+        X_test_seq: Test sequences (encoded)
+        X_test_feat: Test features
+        y_test: Test labels
+        feature_names: List of feature names
+        n_iterations: Number of permutation iterations
+        
+    Returns:
+        Dictionary mapping feature names to importance scores
+    """
+    # Baseline performance
+    y_pred_baseline = model.predict([X_test_seq, X_test_feat], verbose=0)
+    baseline_auc = roc_auc_score(y_test, y_pred_baseline)
+    
+    print(f"Baseline AUC-ROC: {baseline_auc:.4f}")
+    print(f"Computing permutation importance for {len(feature_names)} features...")
+    
+    feature_importance = {}
+    
+    for i, feat_name in enumerate(feature_names):
+        if (i + 1) % 10 == 0:
+            print(f"  Processing feature {i+1}/{len(feature_names)}...")
+        
+        importance_scores = []
+        
+        for _ in range(n_iterations):
+            # Create permuted feature array
+            X_test_feat_permuted = X_test_feat.copy()
+            np.random.shuffle(X_test_feat_permuted[:, i])
+            
+            # Evaluate with permuted feature
+            y_pred_permuted = model.predict([X_test_seq, X_test_feat_permuted], verbose=0)
+            permuted_auc = roc_auc_score(y_test, y_pred_permuted)
+            
+            # Importance = drop in performance
+            importance_scores.append(baseline_auc - permuted_auc)
+        
+        feature_importance[feat_name] = np.mean(importance_scores)
+    
+    return feature_importance
+
+
+def analyze_feature_importance(model: keras.Model, X_test_seq: np.ndarray,
+                               X_test_feat: np.ndarray, y_test: np.ndarray,
+                               top_n: int = 15, save_path: str = 'feature_importance.png') -> Dict[str, float]:
+    """
+    Analyze and visualize top important features.
+    
+    Args:
+        model: Trained Keras model
+        X_test_seq: Test sequences (encoded)
+        X_test_feat: Test features
+        y_test: Test labels
+        top_n: Number of top features to display
+        save_path: Path to save the visualization
+        
+    Returns:
+        Dictionary of feature importance scores
+    """
+    feature_names = get_feature_names()
+    importance = compute_feature_importance(model, X_test_seq, X_test_feat, y_test, feature_names)
+    
+    # Sort by importance
+    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)
+    
+    # Get top N features
+    top_features = sorted_importance[:top_n]
+    top_feat_names = [name for name, _ in top_features]
+    top_feat_scores = [score for _, score in top_features]
+    
+    # Create visualization with more height to prevent overlapping
+    # Use gridspec_kw to give more space to the top plot
+    fig, axes = plt.subplots(2, 1, figsize=(14, 20), 
+                            gridspec_kw={'height_ratios': [2, 1], 'hspace': 0.3})
+    
+    # Plot 1: Top N features horizontal bar chart
+    ax1 = axes[0]
+    colors = plt.cm.viridis(np.linspace(0, 1, len(top_feat_scores)))
+    
+    # Use barh with explicit height to control spacing
+    y_positions = np.arange(len(top_feat_names))
+    bar_height = 0.7
+    bars = ax1.barh(y_positions, top_feat_scores, height=bar_height, color=colors)
+    
+    ax1.set_yticks(y_positions)
+    # Truncate long feature names if needed and use smaller font
+    truncated_names = [name[:40] + '...' if len(name) > 40 else name for name in top_feat_names]
+    ax1.set_yticklabels(truncated_names, fontsize=9)
+    ax1.set_xlabel('Importance Score (AUC-ROC Drop)', fontsize=12, fontweight='bold')
+    ax1.set_title(f'Top {top_n} Most Important Features', fontsize=14, fontweight='bold', pad=20)
+    ax1.grid(axis='x', alpha=0.3, linestyle='--')
+    ax1.axvline(x=0, color='black', linewidth=0.8, linestyle='-')
+    
+    # Set y-axis limits with padding
+    ax1.set_ylim(-0.5, len(top_feat_names) - 0.5)
+    
+    # Add value labels on bars
+    for i, (bar, score) in enumerate(zip(bars, top_feat_scores)):
+        width = bar.get_width()
+        ax1.text(width, bar.get_y() + bar.get_height()/2, 
+                f'{score:+.4f}', ha='left' if width > 0 else 'right', 
+                va='center', fontsize=8, fontweight='bold')
+    
+    # Invert y-axis to show highest importance at top
+    ax1.invert_yaxis()
+    
+    # Plot 2: Feature importance by category
+    ax2 = axes[1]
+    
+    categories = {
+        'Physicochemical': ['hydrophobicity', 'charge', 'polarity', 'aromaticity', 'molecular_weight', 'isoelectric'],
+        'Composition': ['_freq', 'hydrophobic', 'polar', 'charged', 'aromatic', 'aliphatic'],
+        'Sequence-Based': ['length', 'terminal', 'n_terminal', 'c_terminal']
+    }
+    
+    category_avg_importance = {}
+    category_max_importance = {}
+    category_counts = {}
+    
+    for category, keywords in categories.items():
+        cat_features = [(name, score) for name, score in sorted_importance 
+                       if any(kw in name.lower() for kw in keywords)]
+        if cat_features:
+            category_avg_importance[category] = np.mean([score for _, score in cat_features])
+            category_max_importance[category] = max([score for _, score in cat_features])
+            category_counts[category] = len(cat_features)
+    
+    if category_avg_importance:
+        categories_list = list(category_avg_importance.keys())
+        avg_scores = [category_avg_importance[cat] for cat in categories_list]
+        max_scores = [category_max_importance[cat] for cat in categories_list]
+        
+        x = np.arange(len(categories_list))
+        width = 0.35
+        
+        bars1 = ax2.bar(x - width/2, avg_scores, width, label='Average Importance', 
+                       color='steelblue', alpha=0.8)
+        bars2 = ax2.bar(x + width/2, max_scores, width, label='Maximum Importance', 
+                       color='coral', alpha=0.8)
+        
+        ax2.set_xlabel('Feature Category', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('Importance Score', fontsize=12, fontweight='bold')
+        ax2.set_title('Feature Importance by Category', fontsize=14, fontweight='bold', pad=20)
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(categories_list, fontsize=11)
+        ax2.legend(fontsize=10)
+        ax2.grid(axis='y', alpha=0.3, linestyle='--')
+        ax2.axhline(y=0, color='black', linewidth=0.8, linestyle='-')
+        
+        # Add value labels on bars
+        for bars in [bars1, bars2]:
+            for bar in bars:
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height,
+                        f'{height:+.4f}', ha='center', va='bottom' if height > 0 else 'top',
+                        fontsize=9, fontweight='bold')
+        
+        # Add count annotations
+        for i, cat in enumerate(categories_list):
+            count = category_counts[cat]
+            ax2.text(i, max(max_scores[i], avg_scores[i]) + 0.01,
+                    f'n={count}', ha='center', va='bottom', fontsize=9, style='italic')
+    
+    plt.tight_layout(pad=3.0, h_pad=2.0, w_pad=1.0)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"\nFeature importance visualization saved to {save_path}")
+    plt.close()
+    
+    # Print summary to console
+    print("\n" + "=" * 70)
+    print(f"Top {top_n} Most Important Features")
+    print("=" * 70)
+    for i, (feat_name, importance_score) in enumerate(top_features, 1):
+        print(f"{i:2d}. {feat_name:35s}: {importance_score:+.6f}")
+    
+    if category_avg_importance:
+        print("\n" + "=" * 70)
+        print("Feature Importance by Category")
+        print("=" * 70)
+        for category in categories_list:
+            print(f"\n{category}:")
+            print(f"  Average Importance: {category_avg_importance[category]:+.6f}")
+            print(f"  Maximum Importance: {category_max_importance[category]:+.6f}")
+            print(f"  Number of features: {category_counts[category]}")
+    
+    # Save importance to file
+    importance_dict = {name: float(score) for name, score in importance.items()}
+    with open('feature_importance.json', 'w') as f:
+        json.dump(importance_dict, f, indent=2)
+    print(f"\nFeature importance data saved to feature_importance.json")
+    
+    return importance
+
+
 def plot_training_history(history: keras.callbacks.History, save_path: str = 'training_history.png'):
     """
     Plot training curves.
@@ -809,6 +1030,14 @@ def main():
     # Evaluate model
     print("\nEvaluating model on test set...")
     metrics = evaluate_model(model, X_test_encoded, X_test_features_norm, y_test)
+    
+    # Analyze feature importance
+    print("\n" + "=" * 70)
+    print("Feature Importance Analysis")
+    print("=" * 70)
+    feature_importance = analyze_feature_importance(
+        model, X_test_encoded, X_test_features_norm, y_test, top_n=15
+    )
     
     print("\n" + "=" * 60)
     print("Test Set Performance Metrics")
