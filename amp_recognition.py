@@ -185,7 +185,7 @@ def build_model(max_length: int, vocab_size: int, embedding_dim: int = 128) -> k
         optimizer=keras.optimizers.Adam(learning_rate=0.001),
         loss='binary_crossentropy',
         metrics=['accuracy', keras.metrics.Precision(name='precision'), 
-                 keras.metrics.Recall(name='recall'), keras.metrics.AUC(name='auc')]
+                 keras.metrics.Recall(name='sensitivity'), keras.metrics.AUC(name='auc')]
     )
     
     return model
@@ -263,14 +263,27 @@ def evaluate_model(model: keras.Model, X_test: np.ndarray, y_test: np.ndarray) -
     y_pred_proba = model.predict(X_test, verbose=0)
     y_pred = (y_pred_proba > 0.5).astype(int).flatten()
     
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    TN, FP, FN, TP = cm[0, 0], cm[0, 1], cm[1, 0], cm[1, 1]
+    
+    # Calculate Specificity (True Negative Rate)
+    specificity = TN / (TN + FP) if (TN + FP) > 0 else 0.0
+    
+    # Calculate Matthews Correlation Coefficient (MCC)
+    denominator = np.sqrt((TP + FN) * (TN + FP) * (TP + FP) * (TN + FN))
+    mcc = (TP * TN - FP * FN) / denominator if denominator > 0 else 0.0
+    
     # Calculate metrics
     metrics = {
         'accuracy': accuracy_score(y_test, y_pred),
         'precision': precision_score(y_test, y_pred),
-        'recall': recall_score(y_test, y_pred),
+        'sensitivity': recall_score(y_test, y_pred),  # Sensitivity = Recall = True Positive Rate
         'f1_score': f1_score(y_test, y_pred),
+        'specificity': specificity,
+        'mcc': mcc,
         'auc_roc': roc_auc_score(y_test, y_pred_proba),
-        'confusion_matrix': confusion_matrix(y_test, y_pred)
+        'confusion_matrix': cm
     }
     
     return metrics
@@ -438,11 +451,13 @@ def main():
     print("\n" + "=" * 60)
     print("Test Set Performance Metrics")
     print("=" * 60)
-    print(f"Accuracy:  {metrics['accuracy']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall:    {metrics['recall']:.4f}")
-    print(f"F1-Score:  {metrics['f1_score']:.4f}")
-    print(f"AUC-ROC:   {metrics['auc_roc']:.4f}")
+    print(f"Accuracy:    {metrics['accuracy']:.4f}")
+    print(f"Precision:   {metrics['precision']:.4f}")
+    print(f"Sensitivity: {metrics['sensitivity']:.4f}")
+    print(f"Specificity: {metrics['specificity']:.4f}")
+    print(f"F1-Score:    {metrics['f1_score']:.4f}")
+    print(f"MCC:         {metrics['mcc']:.4f}")
+    print(f"AUC-ROC:     {metrics['auc_roc']:.4f}")
     print(f"\nConfusion Matrix:")
     print(f"                Predicted")
     print(f"              Non-AMP   AMP")
